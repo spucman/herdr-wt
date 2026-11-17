@@ -1,0 +1,19 @@
+# Copy this file to .herdr-wt.toml in the root of the source checkout.
+
+# "copy" works on all supported platforms. "symlink" is Linux/macOS only.
+mode = "copy"
+
+# Keep existing target files. Setting this to true replaces selected
+# directories wholesale and can discard tracked edits and untracked files.
+overwrite = false
+
+# Paths are relative to the source checkout. Replace these with your own.
+files = [
+    ".env.local",          # Copy one file, even if Git ignores it.
+    "settings/",           # Copy the whole directory.
+    "fixtures/**/*.json",  # Copy matching regular files recursively.
+]
+
+# Optional: uncomment to run in the target worktree after copying.
+# Commands run with your privileges on every run, including automatic runs.
+# commands = ["git status --short"]

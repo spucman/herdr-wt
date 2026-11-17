@@ -1,0 +1,38 @@
+id = "herdr-wt"
+name = "Worktree initialization"
+version = "0.0.0"
+min_herdr_version = "0.9.5"
+description = "Initialize worktrees from the source checkout"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+platforms = ["linux", "macos"]
+command = ["sh", "scripts/install.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "scripts/install.ps1"]
+
+[[events]]
+on = "worktree.created"
+platforms = ["linux", "macos"]
+command = ["./bin/herdr-wt", "event"]
+
+[[events]]
+on = "worktree.created"
+platforms = ["windows"]
+command = ["./bin/herdr-wt.exe", "event"]
+
+[[actions]]
+id = "run"
+title = "Initialize worktree"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["./bin/herdr-wt", "action"]
+
+[[actions]]
+id = "run-windows"
+title = "Initialize worktree"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["./bin/herdr-wt.exe", "action"]

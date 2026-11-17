@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: matrix
+        run: python3 scripts/release.py validate "$GITHUB_REF_NAME"
+
+  package:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build and test on the release architecture
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --target "$TRIPLE"
+          cargo +1.85.0 test --locked --target "$TRIPLE"
+          cargo +1.85.0 build --release --locked --target "$TRIPLE"
+      - name: Package and smoke test
+        shell: bash
+        env:
+          TARGET: ${{ matrix.name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/release.py package "$GITHUB_REF_NAME" "$TARGET"
+          python scripts/smoke.py "$GITHUB_REF_NAME" "$TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/herdr-wt-*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: herdr-wt-publish-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release.py checksums dist
+          if gh release view "$GITHUB_REF_NAME" --json tagName >/dev/null 2>&1; then
+            mkdir -p published
+            gh release download "$GITHUB_REF_NAME" --dir published --pattern 'herdr-wt-*' --pattern SHA256SUMS
+            python3 scripts/release.py verify-assets published
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+
+  promote:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: release-source
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          path: main
+      - name: Open promotion PR against main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd main
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --dir dist --pattern 'herdr-wt-*' --pattern SHA256SUMS
+          python3 "$GITHUB_WORKSPACE/release-source/scripts/release.py" verify-assets dist
+          branch="release/promote-$GITHUB_REF_NAME"
+          if [ "$(sed -n '2p' release-pin)" = "$GITHUB_REF_NAME" ]; then
+            exit 0
+          fi
+          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" != 0 ]; then
+            exit 0
+          fi
+          # Load the release utility from the tagged source, but operate on the
+          # checked-out main directory and its current pin.
+          PYTHONPATH="$GITHUB_WORKSPACE/release-source/scripts" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import release
+          release.ROOT = Path.cwd()
+          release.promote(os.environ["GITHUB_REF_NAME"], os.environ["GITHUB_REPOSITORY"], Path("dist"))
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git add herdr-plugin.toml release-pin
+          git commit -m "Promote $GITHUB_REF_NAME"
+          git push origin "HEAD:refs/heads/$branch"
+          gh pr create --base main --head "$branch" --title "Promote $GITHUB_REF_NAME" \
+            --body "Pin the published prebuilt packages for Herdr-managed installs."
