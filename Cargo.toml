@@ -32,4 +32,4 @@ rustix = { version = "1", features = ["fs"] }
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1"
 winx = "0.36"
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
