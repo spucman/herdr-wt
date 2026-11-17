@@ -128,6 +128,17 @@ def verify_assets(folder):
         raise SystemExit("published SHA256SUMS does not match the five expected assets")
 
 
+def receipt(target, folder):
+    (folder / f"tested-{target}.sha256").write_text(sha256(folder / asset(target)) + "\n", encoding="ascii")
+
+
+def verify_receipts(tested, folder):
+    for target in TARGETS:
+        expected = (tested / f"tested-{target}.sha256").read_text(encoding="ascii").strip()
+        if sha256(folder / asset(target)) != expected:
+            raise SystemExit(f"archive differs from the smoke-tested {target} artifact")
+
+
 def promote(tag, repo, folder):
     pin = ROOT / "release-pin"
     previous = pin.read_text(encoding="utf-8").splitlines()[1]
@@ -159,6 +170,12 @@ if __name__ == "__main__":
     pkg.add_argument("target", choices=TARGETS)
     sub.add_parser("checksums").add_argument("folder", type=Path)
     sub.add_parser("verify-assets").add_argument("folder", type=Path)
+    record = sub.add_parser("receipt")
+    record.add_argument("target", choices=TARGETS)
+    record.add_argument("folder", type=Path)
+    receipts = sub.add_parser("verify-receipts")
+    receipts.add_argument("tested", type=Path)
+    receipts.add_argument("folder", type=Path)
     promotion = sub.add_parser("promote")
     promotion.add_argument("tag")
     promotion.add_argument("repo")

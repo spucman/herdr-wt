@@ -1,6 +1,12 @@
 mod apply;
 mod checkout;
+mod commands;
 mod config;
+mod fs;
+mod lock;
+mod paths;
+mod plan;
+mod replace;
 
 use anyhow::{bail, Context, Result};
 use std::{env, ffi::OsStr, path::PathBuf, process::ExitCode};
@@ -10,7 +16,7 @@ const HELP: &str =
 
 fn main() -> ExitCode {
     ExitCode::from(match run() {
-        Ok(code) => code,
+        Ok(outcome) => outcome as u8,
         Err(err) => {
             eprintln!("error: {err:#}");
             1
@@ -18,17 +24,31 @@ fn main() -> ExitCode {
     })
 }
 
-fn run() -> Result<u8> {
+#[repr(u8)]
+enum RunOutcome {
+    Success = 0,
+    FileFailure = 2,
+    CommandFailure = 3,
+    SourceRefused = 4,
+}
+
+#[derive(PartialEq, Eq)]
+enum PhaseStatus {
+    Succeeded,
+    Failed,
+}
+
+fn run() -> Result<RunOutcome> {
     let mut args = env::args_os().skip(1);
     let command = args.next();
     match command.as_deref().and_then(OsStr::to_str) {
         Some("--help" | "-h") => {
             println!("{HELP}");
-            return Ok(0);
+            return Ok(RunOutcome::Success);
         }
         Some("--version" | "-V") => {
             println!("herdr-wt {}", env!("CARGO_PKG_VERSION"));
-            return Ok(0);
+            return Ok(RunOutcome::Success);
         }
         Some("run" | "event" | "action") => {}
         _ => bail!("{HELP}"),
@@ -47,7 +67,7 @@ fn run() -> Result<u8> {
             (true, Some("--")) => options = false,
             (true, Some("--help" | "-h")) => {
                 println!("{HELP}");
-                return Ok(0);
+                return Ok(RunOutcome::Success);
             }
             (true, Some("--dry-run")) => dry = true,
             (true, Some("--no-commands")) => no_commands = true,
@@ -57,36 +77,43 @@ fn run() -> Result<u8> {
         }
     }
     let checkouts = if standalone {
-        checkout::standalone(&path.unwrap_or(env::current_dir()?))?
+        checkout::standalone(&match path {
+            Some(path) => path,
+            None => env::current_dir()?,
+        })?
     } else {
         checkout::herdr(event)?
     };
     let Some(checkouts) = checkouts else {
-        return Ok(0);
+        return Ok(RunOutcome::Success);
     };
     if checkout::same(&checkouts.source, &checkouts.target)? {
         eprintln!("refused: target is the source checkout");
-        return Ok(4);
+        return Ok(RunOutcome::SourceRefused);
     }
-    let source = apply::open_root(&checkouts.source).context("open source checkout")?;
-    let target = apply::open_root(&checkouts.target).context("open target worktree")?;
+    let source = fs::open_root(&checkouts.source).context("open source checkout")?;
+    let target = fs::open_root(&checkouts.target).context("open target worktree")?;
     let Some(config) = config::load(&source, &checkouts.source)? else {
         if !event {
             println!("no .herdr-wt.toml in source checkout");
         }
-        return Ok(0);
+        return Ok(RunOutcome::Success);
     };
-    let entries = config::select(&config, &source, &target, &checkouts)?;
+    let entries = plan::select(&config, &source, &target, &checkouts)?;
     let _lock = if !dry && (!entries.is_empty() || (!no_commands && !config.commands.is_empty())) {
-        Some(apply::lock(&checkouts.target)?)
+        Some(lock::lock(&checkouts.target)?)
     } else {
         None
     };
     let failed = apply::files(&config, &entries, &source, &target, &checkouts, dry);
-    if apply::commands(&config, &checkouts, dry, no_commands) {
-        return Ok(3);
+    if commands::run(&config, &checkouts, dry, no_commands) == PhaseStatus::Failed {
+        return Ok(RunOutcome::CommandFailure);
     }
-    Ok(if failed { 2 } else { 0 })
+    Ok(if failed == PhaseStatus::Failed {
+        RunOutcome::FileFailure
+    } else {
+        RunOutcome::Success
+    })
 }
 
 fn quote(path: &std::path::Path) -> String {

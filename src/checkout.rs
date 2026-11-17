@@ -88,7 +88,8 @@ pub fn same(a: &Path, b: &Path) -> io::Result<bool> {
     if a == b {
         return Ok(true);
     }
-    same_file::is_same_file(a, b)
+    use crate::fs::{identity, open_root};
+    Ok(identity(&open_root(a)?)? == identity(&open_root(b)?)?)
 }
 
 pub fn standalone(path: &Path) -> Result<Option<Checkouts>> {

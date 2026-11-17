@@ -107,6 +107,8 @@ Maintainers publish from [spucman/herdr-wt](https://github.com/spucman/herdr-wt)
 
 To roll back managed installs, merge a reviewed PR restoring the previous version pin and digests, then tell users to run `herdr plugin update herdr-wt`. Do not move tags or replace release assets. Linked and standalone users can reinstall the previous archive.
 
+Maintainer reference: [filesystem invariants, dependency reports, and release verification](docs/maintenance.md).
+
 ## License
 
 MIT.

@@ -48,10 +48,11 @@ jobs:
         run: |
           python scripts/release.py package "$GITHUB_REF_NAME" "$TARGET"
           python scripts/smoke.py "$GITHUB_REF_NAME" "$TARGET"
+          python scripts/release.py receipt "$TARGET" dist
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/herdr-wt-*
+          path: dist/
           if-no-files-found: error
 
   publish:
@@ -68,6 +69,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - run: python3 scripts/release.py verify-receipts dist dist
       - name: Publish the complete release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,8 +79,9 @@ jobs:
             mkdir -p published
             gh release download "$GITHUB_REF_NAME" --dir published --pattern 'herdr-wt-*' --pattern SHA256SUMS
             python3 scripts/release.py verify-assets published
+            python3 scripts/release.py verify-receipts dist published
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$GITHUB_REF_NAME" dist/herdr-wt-*.tar.gz dist/herdr-wt-*.zip dist/SHA256SUMS --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
           fi
 
   promote:
@@ -96,6 +99,10 @@ jobs:
           ref: main
           fetch-depth: 0
           path: main
+      - uses: actions/download-artifact@v4
+        with:
+          path: tested
+          merge-multiple: true
       - name: Open promotion PR against main
         env:
           GH_TOKEN: ${{ github.token }}
@@ -104,6 +111,7 @@ jobs:
           mkdir -p dist
           gh release download "$GITHUB_REF_NAME" --dir dist --pattern 'herdr-wt-*' --pattern SHA256SUMS
           python3 "$GITHUB_WORKSPACE/release-source/scripts/release.py" verify-assets dist
+          python3 "$GITHUB_WORKSPACE/release-source/scripts/release.py" verify-receipts "$GITHUB_WORKSPACE/tested" dist
           branch="release/promote-$GITHUB_REF_NAME"
           if [ "$(sed -n '2p' release-pin)" = "$GITHUB_REF_NAME" ]; then
             exit 0

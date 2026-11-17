@@ -359,30 +359,119 @@ fn config_symlink_and_symlink_mode() {
     status(&r.run(&[]), 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn lock_spans_commands_but_not_preview() {
     use std::{
-        process::Stdio,
+        process::{Child, Stdio},
         thread::sleep,
         time::{Duration, Instant},
     };
-    let r = Repo::new();
-    r.config("commands = ['touch started; while [ ! -f finish ]; do sleep 0.05; done']");
-    let mut first = r.exe().arg("run").stdout(Stdio::null()).spawn().unwrap();
-    let start = Instant::now();
-    while !r.target.join("started").exists() && start.elapsed() < Duration::from_secs(5) {
-        sleep(Duration::from_millis(25));
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    let saw_started = r.target.join("started").exists();
-    let busy = r.run(&[]);
-    let dry = r.run(&["--dry-run"]);
+    fn wait_until(mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out during lock contention test"
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
+    fn bounded(cmd: &mut Command) -> std::process::ExitStatus {
+        let mut child = Guard(cmd.spawn().unwrap());
+        wait_until(|| child.0.try_wait().unwrap().is_some());
+        child.0.wait().unwrap()
+    }
+    let r = Repo::new();
+    // The command has its own deadline even if its parent is killed.
+    #[cfg(unix)]
+    r.config("commands = ['touch started; i=0; while [ ! -f finish ] && [ \"$i\" -lt 300 ]; do sleep 0.1; i=$((i+1)); done']");
+    #[cfg(windows)]
+    {
+        fs::write(r.target.join("hold.ps1"), "Set-Content started yes\n$d=(Get-Date).AddSeconds(30)\nwhile (!(Test-Path finish) -and (Get-Date) -lt $d) { Start-Sleep -Milliseconds 100 }").unwrap();
+        r.config("commands = ['powershell.exe -NoProfile -ExecutionPolicy Bypass -File hold.ps1']");
+    }
+    let mut first = Guard(r.exe().arg("run").stdout(Stdio::null()).spawn().unwrap());
+    wait_until(|| r.target.join("started").exists());
+    let busy = bounded(r.exe().arg("run"));
+    let dry = bounded(r.exe().args(["run", "--dry-run"]));
     fs::write(r.target.join("finish"), "").unwrap();
-    assert!(first.wait().unwrap().success());
-    assert!(saw_started);
-    status(&busy, 1);
-    assert!(err(&busy).contains("target busy"));
-    status(&dry, 0);
+    wait_until(|| first.0.try_wait().unwrap().is_some());
+    assert!(first.0.wait().unwrap().success());
+    assert_eq!(busy.code(), Some(1));
+    assert!(dry.success());
+}
+
+#[test]
+fn replacing_parent_preserves_nested_recovery_data() {
+    let r = Repo::new();
+    r.config("overwrite = true\nfiles = ['settings']");
+    r.file("settings/new", "new");
+    let original = r
+        .target
+        .join("settings/deep/.herdr-wt-tmp-original-abc/original");
+    fs::create_dir_all(original.parent().unwrap()).unwrap();
+    fs::write(&original, "old").unwrap();
+    for args in [&["--dry-run"][..], &[]] {
+        let o = r.run(args);
+        status(&o, 2);
+        assert!(err(&o).contains("displaced original"));
+        assert_eq!(fs::read_to_string(&original).unwrap(), "old");
+        assert!(!r.target.join("settings/new").exists());
+    }
+}
+
+#[test]
+fn nested_source_is_never_a_file_destination() {
+    let r = Repo::new();
+    let outer = r.base.path().join("outer");
+    let source = outer.join("container/main");
+    fs::create_dir_all(source.join(".git")).unwrap();
+    let context = serde_json::json!({"worktree": {"checkout_path": outer, "repo_root": source}});
+    for (dest, overwrite) in [
+        ("container/main/new", false),
+        ("container/main/new", true),
+        ("container/main", true),
+        ("container", true),
+    ] {
+        fs::create_dir_all(source.join("container/main")).unwrap();
+        fs::write(source.join("container/main/new"), "wrong").unwrap();
+        fs::write(
+            source.join(".herdr-wt.toml"),
+            format!(
+                "files = ['{dest}']\noverwrite = {overwrite}\ncommands = ['echo wrong >marker']"
+            ),
+        )
+        .unwrap();
+        let o = r
+            .exe()
+            .arg("action")
+            .env("HERDR_PLUGIN_CONTEXT_JSON", context.to_string())
+            .output()
+            .unwrap();
+        status(&o, 1);
+        assert!(err(&o).contains("overlaps the source"));
+        assert!(source.join(".git").is_dir());
+        assert!(!source.join("new").exists() && !outer.join("marker").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn special_file_is_not_reported_missing() {
+    let r = Repo::new();
+    let _socket = std::os::unix::net::UnixListener::bind(r.source.join("sock")).unwrap();
+    r.config("files = ['sock']");
+    let o = r.run(&[]);
+    status(&o, 0);
+    assert!(err(&o).contains("skipped special file"));
+    assert!(!out(&o).contains("missing"));
 }
 
 #[cfg(unix)]

@@ -1,0 +1,39 @@
+name: Dependency health
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - scripts/dependencies.py
+      - scripts/release.py
+      - .github/workflows/dependencies.yml
+permissions:
+  contents: read
+jobs:
+  dependency-health:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Measure base graph
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          cp scripts/dependencies.py "$RUNNER_TEMP/base/scripts/"
+          (cd "$RUNNER_TEMP/base" && python3 scripts/dependencies.py --json "$RUNNER_TEMP/base.json")
+      - name: Measure each release target
+        run: |
+          args=()
+          if [[ -f "$RUNNER_TEMP/base.json" ]]; then args=(--compare "$RUNNER_TEMP/base.json"); fi
+          python3 scripts/dependencies.py --json dependency-graph.json "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph
+          path: dependency-graph.json
+      - run: python3 scripts/dependencies.py --audit

@@ -70,14 +70,14 @@ def host(root, target, override):
     return path
 
 
-def verify_managed(root, target, tag, env, prefix, request):
+def verify_managed(root, target, tag, env, prefix, request, old_archive):
     """Exercise Herdr's real Git install/update path against an isolated fixture."""
     repo = root / "remote"
     repo.mkdir()
     assets = root / "release-assets"
     assets.mkdir()
     name = asset(target)
-    shutil.copy2(OUT / name, assets / name)
+    shutil.copy2(old_archive, assets / name)
     shutil.copytree(ROOT / "scripts", repo / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
     call("git", "init", "-b", "main", cwd=repo, env=env)
     env.update({
@@ -91,7 +91,7 @@ def verify_managed(root, target, tag, env, prefix, request):
     def promote(version):
         (repo / "herdr-plugin.toml").write_text(manifest(template, version), encoding="utf-8")
         (repo / "release-pin").write_text(
-            pin_text(version, "example/herdr-wt", OUT, [target]), encoding="ascii", newline="\n"
+            pin_text(version, "example/herdr-wt", assets, [target]), encoding="ascii", newline="\n"
         )
         call("git", "add", "herdr-plugin.toml", "release-pin", "scripts", cwd=repo, env=env)
         call(
@@ -103,20 +103,17 @@ def verify_managed(root, target, tag, env, prefix, request):
         return request("plugin", "list", "--plugin", "herdr-wt", "--json")["plugins"][0]
 
     request("plugin", "unlink", "herdr-wt")
-    promote(tag)
+    promote("v0.0.0")
     call(*prefix, "plugin", "install", "example/herdr-wt", "--yes", cwd=root, env=env)
     before = installed()
-    assert before["version"] == tag[1:], before
+    assert before["version"] == "0.0.0", before
     assert before["source"]["kind"] == "github", before
     binary = "bin/herdr-wt.exe" if os.name == "nt" else "bin/herdr-wt"
     previous_binary = Path(before["plugin_root"]) / binary
-    assert call(previous_binary, "--version", cwd=root, env=env).stdout.strip() == f"herdr-wt {tag[1:]}"
+    assert call(previous_binary, "--version", cwd=root, env=env).stdout.strip() == "herdr-wt fixture 0.0.0"
     previous_hash = sha256(previous_binary)
-    major, minor, patch = map(int, tag[1:].split("."))
-    next_tag = f"v{major}.{minor}.{patch + 1}"
-    promote(next_tag)
-    # The fixture reuses the same executable. The manifest version and
-    # registered commit must move only after the checksum gate succeeds.
+    shutil.copy2(OUT / name, assets / name)
+    promote(tag)
     (assets / name).write_bytes(b"corrupt package")
     failed = call(*prefix, "plugin", "update", "herdr-wt", "--yes", cwd=root, env=env, ok=False)
     assert failed.returncode and "checksum mismatch" in (failed.stdout + failed.stderr), failed
@@ -124,15 +121,17 @@ def verify_managed(root, target, tag, env, prefix, request):
     shutil.copy2(OUT / name, assets / name)
     call(*prefix, "plugin", "update", "herdr-wt", "--yes", cwd=root, env=env)
     after = installed()
-    assert after["version"] == next_tag[1:], after
+    assert after["version"] == tag[1:], after
     assert after["source"]["resolved_commit"] != before["source"]["resolved_commit"], after
-    assert sha256(Path(after["plugin_root"]) / binary) == previous_hash
+    updated = Path(after["plugin_root"]) / binary
+    assert sha256(updated) != previous_hash
+    assert call(updated, "--version", cwd=root, env=env).stdout.strip() == f"herdr-wt {tag[1:]}"
     no_change = call(*prefix, "plugin", "update", "herdr-wt", "--yes", cwd=root, env=env)
     assert "already up to date" in no_change.stdout
     assert installed()["plugin_root"] == after["plugin_root"]
 
 
-def verify_herdr(root, package, env, target, override, tag):
+def verify_herdr(root, package, env, target, override, tag, old_archive):
     binary = host(root, target, override)
     for key in list(env):
         if key.startswith("HERDR_"):
@@ -182,7 +181,7 @@ def verify_herdr(root, package, env, target, override, tag):
             assert invoked["context"]["workspace_id"] == ws, invoked
             wait(lambda: successful_log(lambda r: r["log_id"] == invoked["log"]["log_id"]))
             assert copied.read_text() == "copied\n"
-            verify_managed(root, target, tag, env, prefix, request)
+            verify_managed(root, target, tag, env, prefix, request, old_archive)
         except Exception:
             print(log.read_text(errors="replace"))
             raise
@@ -244,7 +243,20 @@ def main(tag, target, herdr, skip_host):
         assert error.returncode and "checksum mismatch" in (error.stdout + error.stderr), error
         assert sha256(installed) == sha256(binary)
         if not skip_host:
-            verify_herdr(root, package, env, target, herdr, tag)
+            # Compile a distinct bootstrap fixture in the harness, before
+            # handing the Cargo-free environment to any installer or plugin.
+            fixture_src = root / "old.rs"
+            fixture_src.write_text('fn main() { println!("herdr-wt fixture 0.0.0"); }', encoding="ascii")
+            old_binary = root / exe
+            subprocess.run(["rustc", fixture_src, "-o", old_binary], check=True)
+            old_archive = root / name
+            if windows:
+                with zipfile.ZipFile(old_archive, "w") as archive:
+                    archive.write(old_binary, f"bin/{exe}")
+            else:
+                with tarfile.open(old_archive, "w:gz") as archive:
+                    archive.add(old_binary, f"bin/{exe}")
+            verify_herdr(root, package, env, target, herdr, tag, old_archive)
 
 
 if __name__ == "__main__":
