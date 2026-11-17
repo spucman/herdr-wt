@@ -2,7 +2,7 @@ use crate::{fs::open_root, quote};
 use anyhow::{anyhow, bail, Context, Result};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::OpenOptions;
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsStr,
@@ -10,7 +10,12 @@ use std::{
     path::{Path, PathBuf},
 };
 pub fn digest(value: &OsStr) -> String {
-    format!("{:x}", Sha256::digest(value.as_encoded_bytes()))
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(value.as_encoded_bytes()) {
+        write!(hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
 }
 
 pub fn lock(target: &Path) -> Result<fs::File> {
@@ -44,8 +49,10 @@ pub fn lock(target: &Path) -> Result<fs::File> {
     if !file.metadata()?.is_file() {
         bail!("invalid lock file");
     }
-    if !FileExt::try_lock_exclusive(&file)? {
-        bail!("target busy: {}", quote(target));
+    match FileExt::try_lock(&file) {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => bail!("target busy: {}", quote(target)),
+        Err(TryLockError::Error(err)) => return Err(err).context("acquire target lock"),
     }
     Ok(file)
 }

@@ -1,4 +1,3 @@
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -238,12 +237,12 @@ fn overwrite_and_displaced_original() {
     assert!(r.target.join("dir/nested/b").is_file());
     assert!(r.target.join("leaf").is_file());
 
-    let spelling = if cfg!(windows) || r.target.join(".GIT").exists() {
-        "DIR"
+    // Existing backup keys must survive digest-library upgrades.
+    let digest = if cfg!(windows) || r.target.join(".GIT").exists() {
+        "d313ad93be2d2599267359ea396fa98713c2a69d8530c6da6b00d6b9380bc872"
     } else {
-        "dir"
+        "2b64c6d9afd8a34ed0dbf35f7de171a8825a50d9f42f05e98fe2b1addf00ab44"
     };
-    let digest = format!("{:x}", Sha256::digest(spelling.as_bytes()));
     let backup = r
         .target
         .join(format!(".herdr-wt-tmp-original-{digest}"))

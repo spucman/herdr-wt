@@ -75,7 +75,7 @@ If an interrupted replacement leaves a displaced original, the diagnostic names 
 
 ## Build from source
 
-Developer builds require Rust 1.85+ with Cargo and Git 2.36+ for the worktree integration tests:
+Developer builds require Rust 1.88+ with Cargo and Git 2.36+ for the worktree integration tests:
 
 ```sh
 git clone https://github.com/spucman/herdr-wt.git

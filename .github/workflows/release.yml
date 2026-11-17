@@ -37,9 +37,9 @@ jobs:
         env:
           TRIPLE: ${{ matrix.triple }}
         run: |
-          rustup toolchain install 1.85.0 --profile minimal --target "$TRIPLE"
-          cargo +1.85.0 test --locked --target "$TRIPLE"
-          cargo +1.85.0 build --release --locked --target "$TRIPLE"
+          rustup toolchain install 1.88.0 --profile minimal --target "$TRIPLE"
+          cargo +1.88.0 test --locked --target "$TRIPLE"
+          cargo +1.88.0 build --release --locked --target "$TRIPLE"
       - name: Package and smoke test
         shell: bash
         env:

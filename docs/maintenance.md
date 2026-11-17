@@ -18,7 +18,7 @@ Name matching uses the target root’s Git marker to infer case sensitivity with
 
 Run `python3 scripts/dependencies.py` to count unique package versions **separately for each release target**. Production includes normal and build dependencies (including proc macros); the test column is the incremental normal/build/dev graph. Counts are not binary size. Use `--json report.json` to retain package lists and `--compare base.json` to see version and membership changes. `--audit` checks all locked registry versions against OSV.
 
-Dependabot checks Cargo and GitHub Actions weekly. The dependency workflow reports base-to-PR changes and runs a scheduled advisory check. Keep Rust 1.85 CI green when updating dependencies; do not reject a crate solely for a `0.x` version. Herdr's minimum-host smoke test intentionally stays pinned to 0.9.5 and its asset digests until the supported minimum changes.
+Dependabot checks Cargo and GitHub Actions weekly. The dependency workflow reports base-to-PR changes and runs a scheduled advisory check. Keep Rust 1.88 CI green when updating dependencies; do not reject a crate solely for a `0.x` version. Herdr's minimum-host smoke test intentionally stays pinned to 0.9.5 and its asset digests until the supported minimum changes.
 
 ## Package verification and performance
 
