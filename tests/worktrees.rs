@@ -387,18 +387,39 @@ fn lock_spans_commands_but_not_preview() {
 
 #[cfg(unix)]
 #[test]
-fn copied_file_preserves_mtime_and_strips_special_mode_bits() {
+fn copied_tree_preserves_file_mtime_and_strips_special_mode_bits() {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, SystemTime};
     let r = Repo::new();
-    r.config("files = ['tool']");
-    r.file("tool", "test");
-    let src = r.source.join("tool");
+    r.config("files = ['tools']");
+    r.file("tools/tool", "test");
+    let src = r.source.join("tools/tool");
     let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
     fs::File::open(&src).unwrap().set_modified(mtime).unwrap();
     fs::set_permissions(&src, fs::Permissions::from_mode(0o4755)).unwrap();
+    fs::set_permissions(r.source.join("tools"), fs::Permissions::from_mode(0o1750)).unwrap();
     status(&r.run(&[]), 0);
-    let copied = fs::metadata(r.target.join("tool")).unwrap();
+    let copied = fs::metadata(r.target.join("tools/tool")).unwrap();
     assert_eq!(copied.modified().unwrap(), mtime);
     assert_eq!(copied.permissions().mode() & 0o7777, 0o755);
+    let copied_dir = fs::metadata(r.target.join("tools")).unwrap();
+    assert_eq!(copied_dir.permissions().mode() & 0o7777, 0o750);
+}
+
+#[cfg(windows)]
+#[test]
+fn target_lock_uses_local_app_data() {
+    let r = Repo::new();
+    r.config("files = ['sample']");
+    r.file("sample", "value");
+
+    let locks = r.base.path().join("home/herdr-wt/locks");
+    status(&r.run(&["--dry-run"]), 0);
+    assert!(!locks.exists());
+    status(&r.run(&[]), 0);
+    assert_eq!(fs::read_dir(locks).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_to_string(r.target.join("sample")).unwrap(),
+        "value"
+    );
 }

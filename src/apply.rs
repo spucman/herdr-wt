@@ -133,11 +133,10 @@ fn digest(value: &OsStr) -> String {
 }
 
 pub fn lock(target: &Path) -> Result<fs::File> {
-    let mut base = directories::BaseDirs::new()
+    let base = lock_data_dir()
         .ok_or_else(|| anyhow!("cannot find per-user directory for target lock"))?
-        .data_local_dir()
-        .join("herdr-wt");
-    base.push("locks");
+        .join("herdr-wt")
+        .join("locks");
     if base.starts_with(target) {
         bail!("per-user lock directory would be inside target");
     }
@@ -175,6 +174,18 @@ pub fn lock(target: &Path) -> Result<fs::File> {
         bail!("target busy: {}", quote(target));
     }
     Ok(file)
+}
+
+fn lock_data_dir() -> Option<PathBuf> {
+    // Windows runners can provide LOCALAPPDATA even when some Known Folder
+    // lookups fail. The lock only needs the local data directory.
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().to_owned())
 }
 
 fn remove(dir: &Dir, entry: &OsStr) -> io::Result<()> {
@@ -295,17 +306,18 @@ fn copy_dir(source: &Dir, target: &Dir, at: &Path, excluded: Option<&Path>) -> R
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = source
-            .try_clone()?
-            .into_std_file()
-            .metadata()?
-            .permissions()
-            .mode();
-        target
-            .try_clone()?
-            .into_std_file()
-            .set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+        use rustix::fs::{fchmod, fstat, openat, Mode, OFlags};
+
+        let mode = Mode::from_raw_mode(fstat(source)?.st_mode & 0o777);
+        // Capability directories may use O_PATH on Linux, which fchmod
+        // rejects. Open a real descriptor relative to the staged directory.
+        let handle = openat(
+            target,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        fchmod(handle, mode).context("set staged directory permissions")?;
     }
     Ok(())
 }
