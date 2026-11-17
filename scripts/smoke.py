@@ -9,6 +9,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import traceback
 import zipfile
 
 from release import ROOT, OUT, TARGETS, asset, manifest, pin_text, sha256
@@ -265,4 +266,13 @@ if __name__ == "__main__":
     parser.add_argument("target", choices=TARGETS)
     parser.add_argument("--herdr", type=Path)
     parser.add_argument("--skip-host", action="store_true", default=False)
-    main(**vars(parser.parse_args()))
+    try:
+        main(**vars(parser.parse_args()))
+    except Exception as exc:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            frames = traceback.extract_tb(exc.__traceback__)
+            frame = next(f for f in reversed(frames) if f.filename == __file__)
+            message = f"{frame.name}: {type(exc).__name__}: {exc}"
+            message = message[:2000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::error file=scripts/smoke.py,line={frame.lineno}::{message}", flush=True)
+        raise

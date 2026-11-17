@@ -25,14 +25,19 @@ jobs:
         with: {python-version: '3.12'}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - shell: bash
+      - name: Build release executable
+        shell: bash
         env:
-          TARGET: ${{ matrix.target }}
           TRIPLE: ${{ matrix.triple }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           rustup target add "$TRIPLE"
           cargo build --locked --release --target "$TRIPLE"
+      - name: Verify packaged executable, install hooks, and Herdr integration
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
           tag=$(python -c 'import tomllib; print("v"+tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           python scripts/release.py package "$tag" "$TARGET"
           python scripts/smoke.py "$tag" "$TARGET"
