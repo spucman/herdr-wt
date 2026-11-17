@@ -10,7 +10,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
-cap-std = "3.4"
+cap-std = "4.0"
 cap-fs-ext = "3.4"
 dirs-sys = "0.5"
 dunce = "1"
