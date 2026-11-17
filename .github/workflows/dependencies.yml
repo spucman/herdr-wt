@@ -32,7 +32,7 @@ jobs:
           args=()
           if [[ -f "$RUNNER_TEMP/base.json" ]]; then args=(--compare "$RUNNER_TEMP/base.json"); fi
           python3 scripts/dependencies.py --json dependency-graph.json "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dependency-graph
           path: dependency-graph.json
