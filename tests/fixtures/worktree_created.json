@@ -1,0 +1,33 @@
+{
+  "event": "worktree_created",
+  "data": {
+    "type": "worktree_created",
+    "workspace": {
+      "workspace_id": "REPLACE_ID",
+      "number": 5,
+      "label": "spike-a",
+      "focused": false,
+      "pane_count": 1,
+      "tab_count": 1,
+      "active_tab_id": "REPLACE_ID",
+      "agent_status": "unknown",
+      "worktree": {
+        "repo_key": "/REPLACE/main/.git",
+        "repo_name": "main-repo",
+        "repo_root": "/REPLACE/main",
+        "checkout_path": "/REPLACE/worktree",
+        "is_linked_worktree": true
+      }
+    },
+    "worktree": {
+      "path": "/REPLACE/worktree",
+      "branch": "spike-a",
+      "is_bare": false,
+      "is_detached": false,
+      "is_prunable": false,
+      "is_linked_worktree": true,
+      "open_workspace_id": "REPLACE_ID",
+      "label": "main-repo"
+    }
+  }
+}

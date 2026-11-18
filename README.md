@@ -52,7 +52,9 @@ files = [".env.local", "settings/", "fixtures/**/*.json"]
 
 The plugin reads files as they exist on disk, including ignored files and uncommitted edits. It rejects explicitly selected paths and config symlinks that resolve outside the source checkout. Links encountered inside a copied directory are recreated without reading their targets and can still point outside the worktree. Windows supports copy mode only; symlink mode on Linux/macOS uses absolute links that break if the source moves.
 
-**Trust the repository before enabling automatic runs.** Configured commands run with your privileges, without a separate prompt. `overwrite = true` replaces a selected directory rather than merging it and can discard tracked edits and untracked files. Commands run again on a rerun, even when every existing destination is skipped. Use `--no-commands` to skip them or `--dry-run` to preview without writing or locking. `HERDR_WT_DRY_RUN=1` also enables dry run.
+Glob patterns select regular files only. They never follow symlinks or enter `.git` directories or nested repositories. Each symlink a glob matches is skipped with the warning `warning: skipped <path> (symlink matched by glob; list it literally)`, printed once per link. The warning is omitted when another entry selects that link or a directory containing it. List a symlink explicitly to select it. An unreadable directory under a glob is a preflight error, and the run fails before any copy.
+
+**Trust the repository before enabling automatic runs.** Configured commands run with your privileges, without a separate prompt. `overwrite = true` replaces a selected directory rather than merging it and can discard tracked edits and untracked files. An existing target directory that is not writable by the current user is not replaced: its entry fails with `cannot replace <path> (read-only)` (exit 2), and herdr-wt does not change its permissions. This check runs on Unix only; Windows has no such check. Command text is written to the plugin log on every run, so do not embed secrets in `commands`. Commands run again on a rerun, even when every existing destination is skipped. Use `--no-commands` to skip them or `--dry-run` to preview without writing or locking. `HERDR_WT_DRY_RUN=1` also enables dry run.
 
 Herdr runs the plugin asynchronously only when it creates a worktree. Opening an existing worktree, restoring a workspace, or running `git worktree add` does not trigger it. To rerun in a Herdr-managed worktree workspace:
 
@@ -66,7 +68,7 @@ On Windows, invoke `herdr-wt.run-windows`. The action uses the workspace’s rec
 | Exit | Meaning |
 | --- | --- |
 | `0` | Success or expected no-op |
-| `1` | Setup or preflight failure, including a busy target |
+| `1` | Setup or preflight failure, including a busy target or an internal error |
 | `2` | File application failure |
 | `3` | Command failure; takes precedence over file failures |
 | `4` | Refused to initialize the source checkout |

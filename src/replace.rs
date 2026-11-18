@@ -5,7 +5,11 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
-use std::{ffi::OsStr, io, path::Path};
+use std::{
+    ffi::OsStr,
+    io::{self, Write},
+    path::Path,
+};
 const STAGING: &str = ".herdr-wt-tmp-stage-";
 pub const BACKUP: &str = ".herdr-wt-tmp-original-";
 
@@ -36,6 +40,91 @@ pub fn ensure_recoverable(dir: &Dir, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remember the first error of a best-effort walk without stopping it.
+#[cfg(unix)]
+fn keep_first(first: &mut io::Result<()>, next: io::Result<()>) {
+    if first.is_ok() {
+        *first = next;
+    }
+}
+
+/// Add owner rwx to the directory `name` below `parent` without following links.
+#[cfg(unix)]
+fn grant_owner_rwx(parent: &Dir, name: &OsStr) -> io::Result<()> {
+    use rustix::{
+        fs::{fchmod, fstat, openat, Mode, OFlags},
+        io::Errno,
+    };
+
+    // Capability directories may use O_PATH on Linux, which fchmod rejects.
+    let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match openat(parent, name, OFlags::RDONLY | flags, Mode::empty()) {
+        Ok(handle) => {
+            let mode = fstat(&handle)?.st_mode & 0o777;
+            Ok(fchmod(&handle, Mode::from_raw_mode(mode | 0o700))?)
+        }
+        Err(Errno::ACCESS) => grant_unreadable(parent, name, flags),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A directory without the read bit cannot be opened for `fchmod`; chmod the
+/// inode behind an `O_PATH` handle instead, which never resolves a link.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn grant_unreadable(parent: &Dir, name: &OsStr, flags: rustix::fs::OFlags) -> io::Result<()> {
+    use rustix::fs::{chmod, fstat, openat, Mode, OFlags};
+    use std::os::fd::AsRawFd;
+
+    let handle = openat(parent, name, OFlags::PATH | flags, Mode::empty())?;
+    let mode = fstat(&handle)?.st_mode & 0o777;
+    let proc_path = format!("/proc/self/fd/{}", handle.as_raw_fd());
+    Ok(chmod(proc_path, Mode::from_raw_mode(mode | 0o700))?)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn grant_unreadable(_: &Dir, _: &OsStr, _: rustix::fs::OFlags) -> io::Result<()> {
+    Err(io::ErrorKind::PermissionDenied.into())
+}
+
+/// Best-effort: restore owner rwx on the read-only tree at `name` so it can be
+/// deleted. Links are never followed. A failure on one entry never prevents
+/// its siblings from being fixed; the first error is returned at the end.
+#[cfg(unix)]
+fn make_writable(parent: &Dir, name: &OsStr) -> io::Result<()> {
+    let mut result = grant_owner_rwx(parent, name);
+    let dir = match parent.open_dir_nofollow(name) {
+        Ok(dir) => dir,
+        Err(e) => {
+            keep_first(&mut result, Err(e));
+            return result;
+        }
+    };
+    let entries = match dir.entries() {
+        Ok(entries) => entries,
+        Err(e) => {
+            keep_first(&mut result, Err(e));
+            return result;
+        }
+    };
+    for item in entries {
+        let child = match item {
+            Ok(item) => item.file_name(),
+            Err(e) => {
+                keep_first(&mut result, Err(e));
+                continue;
+            }
+        };
+        match dir.symlink_metadata(&child) {
+            Ok(m) if !is_link(&m) && m.is_dir() => {
+                keep_first(&mut result, make_writable(&dir, &child));
+            }
+            Ok(_) => {}
+            Err(e) => keep_first(&mut result, Err(e)),
+        }
+    }
+    result
+}
+
 fn remove(dir: &Dir, entry: &OsStr) -> io::Result<()> {
     let Some(m) = inspect(dir, entry)? else {
         return Ok(());
@@ -47,6 +136,14 @@ fn remove(dir: &Dir, entry: &OsStr) -> io::Result<()> {
         return dir.remove_file(entry);
     }
     if m.is_dir() {
+        // Only trees this module created may be made writable; never a user directory.
+        #[cfg(unix)]
+        if entry
+            .to_str()
+            .is_some_and(|s| s.starts_with(STAGING) || s.starts_with(BACKUP))
+        {
+            let _ = make_writable(dir, entry);
+        }
         dir.remove_dir_all(entry)
     } else {
         dir.remove_file(entry)
@@ -82,7 +179,9 @@ impl<'a> Stage<'a> {
 impl Drop for Stage<'_> {
     fn drop(&mut self) {
         if let Err(e) = remove(self.parent, OsStr::new(&self.name)) {
-            eprintln!(
+            // Not eprintln!: it panics on a broken stderr, fatal inside drop.
+            let _ = writeln!(
+                io::stderr(),
                 "warning: could not remove staging directory {}: {e}",
                 self.name
             );
@@ -192,5 +291,130 @@ mod tests {
             "old contents"
         );
         assert!(!temp.path().join(backup).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_never_chmods_unprefixed_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user");
+        fs::create_dir(&user).unwrap();
+        fs::write(user.join("x"), "kept").unwrap();
+        fs::set_permissions(&user, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::File::create(user.join("probe")).is_ok() {
+            eprintln!("skipped: running as root");
+            return;
+        }
+        let dir = open_root(temp.path()).unwrap();
+
+        let result = remove(&dir, OsStr::new("user"));
+
+        let mode = fs::metadata(&user).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(&user, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(mode, 0o500);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_makes_prefixed_read_only_trees_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = open_root(temp.path()).unwrap();
+        for prefix in [STAGING, BACKUP] {
+            let name = format!("{prefix}test");
+            let sub = temp.path().join(&name).join("a").join("b");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("f"), "x").unwrap();
+            for p in [sub.clone(), sub.parent().unwrap().to_path_buf()] {
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            fs::set_permissions(temp.path().join(&name), fs::Permissions::from_mode(0o500))
+                .unwrap();
+
+            remove(&dir, OsStr::new(&name)).unwrap();
+
+            assert!(!temp.path().join(&name).exists());
+        }
+    }
+
+    /// Best-effort test cleanup: make every directory under `path` traversable again.
+    #[cfg(unix)]
+    fn restore_modes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::set_permissions(path, fs::Permissions::from_mode(0o700)).is_err() {
+            return;
+        }
+        for item in fs::read_dir(path).into_iter().flatten().flatten() {
+            if item.file_type().is_ok_and(|t| t.is_dir()) {
+                restore_modes(&item.path());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn remove_handles_unreadable_siblings_among_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("probe");
+        fs::create_dir(&probe).unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o500)).unwrap();
+        let root = fs::File::create(probe.join("probe")).is_ok();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+        if root {
+            eprintln!("skipped: running as root");
+            return;
+        }
+        let dir = open_root(temp.path()).unwrap();
+        let name = format!("{BACKUP}siblings");
+        let tree = temp.path().join(&name);
+        // (directory, mode) per sibling; "inner" nests below the unreadable one.
+        let siblings = [
+            ("a", 0o500),
+            ("b", 0o000),
+            ("c", 0o500),
+            ("d", 0o300),
+            ("e", 0o500),
+        ];
+        for (sibling, _) in siblings {
+            let inner = tree.join(sibling).join("inner");
+            fs::create_dir_all(&inner).unwrap();
+            fs::write(inner.join("f"), "x").unwrap();
+            fs::set_permissions(&inner, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        for (sibling, mode) in siblings {
+            fs::set_permissions(tree.join(sibling), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::set_permissions(&tree, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = remove(&dir, OsStr::new(&name));
+
+        let leftover = tree.exists();
+        restore_modes(&tree);
+        result.unwrap();
+        assert!(!leftover);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_writable_never_follows_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o500)).unwrap();
+        let name = format!("{STAGING}links");
+        let tree = temp.path().join(&name);
+        fs::create_dir(&tree).unwrap();
+        symlink(&outside, tree.join("link")).unwrap();
+        let dir = open_root(temp.path()).unwrap();
+
+        let _ = make_writable(&dir, OsStr::new(&name));
+
+        let mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode, 0o500);
     }
 }

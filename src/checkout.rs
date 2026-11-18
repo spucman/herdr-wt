@@ -1,6 +1,5 @@
 use crate::quote;
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -102,34 +101,6 @@ pub fn standalone(path: &Path) -> Result<Option<Checkouts>> {
     discover(target.clone(), &target)
 }
 
-#[derive(Default, Deserialize)]
-struct Provenance {
-    checkout_path: Option<String>,
-    repo_root: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Workspace {
-    worktree: Option<Provenance>,
-}
-
-#[derive(Deserialize)]
-struct Event {
-    event: String,
-    data: EventData,
-}
-
-#[derive(Deserialize)]
-struct EventData {
-    worktree: Option<EventWorktree>,
-    workspace: Option<Workspace>,
-}
-
-#[derive(Deserialize)]
-struct EventWorktree {
-    path: Option<String>,
-}
-
 fn host_path(path: &str) -> Result<PathBuf> {
     let p = Path::new(path);
     if !p.is_absolute() || path.contains('\u{fffd}') {
@@ -138,35 +109,51 @@ fn host_path(path: &str) -> Result<PathBuf> {
     root(p)
 }
 
+fn text(v: &serde_json::Value, pointer: &str) -> Option<String> {
+    v.pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn payload(name: &str, what: &str) -> Result<String> {
+    match env::var(name) {
+        Ok(raw) => Ok(raw),
+        Err(env::VarError::NotPresent) => bail!("missing {what} ({name} is not set)"),
+        Err(env::VarError::NotUnicode(_)) => bail!("invalid {what}: {name} is not Unicode"),
+    }
+}
+
+fn event_paths(raw: &str) -> Result<(Option<String>, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(raw).context("invalid Herdr event payload")?;
+    match v.get("event") {
+        None => bail!("invalid Herdr event payload: missing event name"),
+        Some(serde_json::Value::String(s))
+            if matches!(s.as_str(), "worktree.created" | "worktree_created") => {}
+        Some(serde_json::Value::String(s)) => bail!("expected worktree.created event, got {s:?}"),
+        Some(other) => bail!("expected worktree.created event, got {other}"),
+    }
+    let target = text(&v, "/data/worktree/path")
+        .or_else(|| text(&v, "/data/workspace/worktree/checkout_path"));
+    Ok((target, text(&v, "/data/workspace/worktree/repo_root")))
+}
+
+fn context_paths(raw: &str) -> Result<(Option<String>, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(raw).context("invalid Herdr action context")?;
+    Ok((
+        text(&v, "/worktree/checkout_path"),
+        text(&v, "/worktree/repo_root"),
+    ))
+}
+
 pub fn herdr(event: bool) -> Result<Option<Checkouts>> {
     let (target, source) = if event {
-        let raw = env::var("HERDR_PLUGIN_EVENT_JSON").context("missing Herdr event payload")?;
-        let event: Event = serde_json::from_str(&raw).context("invalid Herdr event payload")?;
-        if !matches!(
-            event.event.as_str(),
-            "worktree_created" | "worktree.created"
-        ) {
-            bail!("expected worktree.created event");
-        }
-        let ws = event
-            .data
-            .workspace
-            .and_then(|w| w.worktree)
-            .unwrap_or_default();
-        (
-            event
-                .data
-                .worktree
-                .and_then(|t| t.path)
-                .or(ws.checkout_path),
-            ws.repo_root,
-        )
+        event_paths(&payload("HERDR_PLUGIN_EVENT_JSON", "Herdr event payload")?)?
     } else {
-        let raw = env::var("HERDR_PLUGIN_CONTEXT_JSON").context("missing Herdr action context")?;
-        let context: Workspace =
-            serde_json::from_str(&raw).context("invalid Herdr action context")?;
-        let ws = context.worktree.unwrap_or_default();
-        (ws.checkout_path, ws.repo_root)
+        context_paths(&payload(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            "Herdr action context",
+        )?)?
     };
     let target =
         host_path(&target.ok_or_else(|| {
@@ -283,5 +270,172 @@ fn discover(target: PathBuf, query: &Path) -> Result<Option<Checkouts>> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const EVENT_FIXTURE: &str = include_str!("../tests/fixtures/worktree_created.json");
+    const CONTEXT_FIXTURE: &str = include_str!("../tests/fixtures/action_context.json");
+
+    fn event(value: serde_json::Value) -> Result<(Option<String>, Option<String>)> {
+        event_paths(&value.to_string())
+    }
+
+    fn event_error(value: serde_json::Value) -> String {
+        event(value)
+            .expect_err("event must be rejected")
+            .to_string()
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_owned())
+    }
+
+    #[test]
+    fn event_reads_real_fixture() {
+        assert_eq!(
+            event_paths(EVENT_FIXTURE).unwrap(),
+            (some("/REPLACE/worktree"), some("/REPLACE/main"))
+        );
+    }
+
+    #[test]
+    fn context_reads_real_fixture() {
+        assert_eq!(
+            context_paths(CONTEXT_FIXTURE).unwrap(),
+            (some("/REPLACE/worktree"), some("/REPLACE/main"))
+        );
+    }
+
+    #[test]
+    fn event_prefers_worktree_path() {
+        let (target, _) = event(json!({
+            "event": "worktree.created",
+            "data": {
+                "worktree": {"path": "/direct"},
+                "workspace": {"worktree": {"checkout_path": "/fallback"}}
+            }
+        }))
+        .unwrap();
+        assert_eq!(target, some("/direct"));
+    }
+
+    #[test]
+    fn event_falls_back_when_path_is_null_empty_missing_or_not_a_string() {
+        let worktrees = [
+            json!({"path": null}),
+            json!({"path": ""}),
+            json!({}),
+            json!({"path": 42}),
+        ];
+        for worktree in worktrees {
+            let (target, _) = event(json!({
+                "event": "worktree.created",
+                "data": {
+                    "worktree": worktree,
+                    "workspace": {"worktree": {"checkout_path": "/fallback"}}
+                }
+            }))
+            .unwrap();
+            assert_eq!(target, some("/fallback"), "worktree: {worktree}");
+        }
+    }
+
+    #[test]
+    fn event_without_any_path_is_none() {
+        let (target, _) = event(json!({"event": "worktree_created", "data": {}})).unwrap();
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn event_requires_known_name() {
+        assert!(event_error(json!({"data": {}})).contains("missing event name"));
+        assert!(
+            event_error(json!({"event": "worktree.removed"})).contains("got \"worktree.removed\"")
+        );
+        assert!(event_error(json!({"event": 42})).contains("got 42"));
+        assert!(event_error(json!({"event": null})).contains("got null"));
+        let escaped = event_error(json!({"event": "a\nb"}));
+        assert!(escaped.contains("got \"a\\nb\""));
+        assert!(!escaped.contains('\n'));
+        assert!(event(json!({"event": "worktree.created"})).is_ok());
+        assert!(event(json!({"event": "worktree_created"})).is_ok());
+    }
+
+    #[test]
+    fn invalid_json_is_an_error() {
+        assert!(event_paths("not json").is_err());
+    }
+
+    #[test]
+    fn context_with_null_worktree_is_none() {
+        assert_eq!(
+            context_paths(r#"{"worktree": null}"#).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn non_string_repo_root_is_ignored() {
+        let (_, source) = event(json!({
+            "event": "worktree.created",
+            "data": {"workspace": {"worktree": {"repo_root": 5}}}
+        }))
+        .unwrap();
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn records_parse_bare_branch_detached_prunable_and_spaces() {
+        let input = b"worktree /a b\0HEAD 1\0branch refs/heads/main\0\0worktree /bare\0bare\0\0worktree /p\0detached\0prunable gitdir file points to non-existent location\0\0";
+        let parsed = records(input);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].path, Some(&b"/a b"[..]));
+        assert_eq!(parsed[0].branch, Some(&b"refs/heads/main"[..]));
+        assert!(!parsed[0].bare);
+        assert!(!parsed[0].prunable);
+        assert_eq!(parsed[1].path, Some(&b"/bare"[..]));
+        assert!(parsed[1].bare);
+        assert_eq!(parsed[2].path, Some(&b"/p"[..]));
+        assert_eq!(parsed[2].branch, None);
+        assert!(parsed[2].prunable);
+    }
+
+    #[test]
+    fn records_keep_newlines_in_paths() {
+        let parsed = records(b"worktree /x\ny\0\0");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, Some(&b"/x\ny"[..]));
+    }
+
+    #[test]
+    fn records_of_empty_output_is_empty() {
+        assert!(records(b"").is_empty());
+    }
+
+    #[test]
+    fn git_env_is_local_matches_repository_variables() {
+        for key in [
+            "GIT_DIR",
+            "git_dir",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_3",
+            "GIT_QUARANTINE_PATH",
+            "GIT_INTERNAL_SUPER_PREFIX",
+        ] {
+            assert!(git_env_is_local(key), "{key}");
+        }
+        for key in [
+            "GIT_AUTHOR_NAME",
+            "GIT_SSH_COMMAND",
+            "GIT_OPTIONAL_LOCKS",
+            "FOO",
+        ] {
+            assert!(!git_env_is_local(key), "{key}");
+        }
     }
 }

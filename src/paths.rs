@@ -139,3 +139,134 @@ fn relative_absolute_link(link: &Path, root: &Path) -> Result<PathBuf> {
     }
     bail!("resolves outside the source checkout")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err_text(r: Result<impl std::fmt::Debug>) -> String {
+        format!("{:#}", r.unwrap_err())
+    }
+
+    #[test]
+    fn git_name_matches_dot_git_and_short_names() {
+        for s in [
+            ".git", ".GIT", ".git.", ".git ", ".git. .", "GIT~1", "git~12", "GIT~1.",
+        ] {
+            assert!(git_name(OsStr::new(s)), "{s:?}");
+        }
+        for s in [".gitignore", ".github", "git~", "git~a", "my.git", ".git~1"] {
+            assert!(!git_name(OsStr::new(s)), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn protected_name_covers_staging_prefix() {
+        for s in [".herdr-wt-tmp-stage-1", ".HERDR-WT-TMP-x"] {
+            assert!(protected_name(OsStr::new(s)), "{s:?}");
+        }
+        for s in [".herdr-wt-tmpx", "herdr-wt-tmp-x"] {
+            assert!(!protected_name(OsStr::new(s)), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn windows_bad_flags_reserved_and_unrepresentable_names() {
+        for s in [
+            "CON",
+            "con.txt",
+            "COM1",
+            "LPT9.log",
+            "COM\u{b9}",
+            "a.",
+            "a ",
+            "a<b",
+            "a\u{1}",
+        ] {
+            assert!(windows_bad(s), "{s:?}");
+        }
+        for s in ["CONSOLE", "COM0", "COM10", "normal.txt"] {
+            assert!(!windows_bad(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn validate_resolved_rejects_root_and_protected_paths() {
+        assert!(err_text(validate_resolved(Path::new(""))).contains("source root"));
+        assert!(validate_resolved(Path::new("a/.git")).is_err());
+        assert!(validate_resolved(Path::new("a/b")).is_ok());
+    }
+
+    #[test]
+    fn resolve_returns_none_for_missing_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let dir = fs::open_root(&root).unwrap();
+        assert_eq!(resolve(&dir, Path::new("nope"), &root).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_rejects_parent_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        let dir = fs::open_root(&root).unwrap();
+        assert!(err_text(resolve(&dir, Path::new("a/../.."), &root)).contains("outside"));
+    }
+
+    #[cfg(unix)]
+    mod symlinks {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        fn root_with_file() -> (tempfile::TempDir, PathBuf, Dir) {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(tmp.path()).unwrap();
+            std::fs::write(root.join("target"), "x").unwrap();
+            let dir = fs::open_root(&root).unwrap();
+            (tmp, root, dir)
+        }
+
+        #[test]
+        fn relative_symlink_resolves_to_its_target() {
+            let (_tmp, root, dir) = root_with_file();
+            symlink("target", root.join("link")).unwrap();
+            let got = resolve(&dir, Path::new("link"), &root).unwrap();
+            assert_eq!(got, Some(PathBuf::from("target")));
+        }
+
+        #[test]
+        fn absolute_symlink_inside_root_becomes_relative() {
+            let (_tmp, root, dir) = root_with_file();
+            symlink(root.join("target"), root.join("link")).unwrap();
+            let got = resolve(&dir, Path::new("link"), &root).unwrap();
+            assert_eq!(got, Some(PathBuf::from("target")));
+        }
+
+        #[test]
+        fn symlink_outside_root_is_rejected() {
+            let (_tmp, root, dir) = root_with_file();
+            symlink("/etc", root.join("link")).unwrap();
+            assert!(resolve(&dir, Path::new("link"), &root).is_err());
+        }
+
+        #[test]
+        fn symlink_self_loop_is_rejected() {
+            let (_tmp, root, dir) = root_with_file();
+            symlink("l", root.join("l")).unwrap();
+            let msg = err_text(resolve(&dir, Path::new("l"), &root));
+            assert!(msg.contains("too many source symlinks"), "{msg}");
+        }
+
+        #[test]
+        fn forty_one_link_chain_is_rejected() {
+            let (_tmp, root, dir) = root_with_file();
+            symlink("target", root.join("l0")).unwrap();
+            for i in 1..=40 {
+                symlink(format!("l{}", i - 1), root.join(format!("l{i}"))).unwrap();
+            }
+            let msg = err_text(resolve(&dir, Path::new("l40"), &root));
+            assert!(msg.contains("too many source symlinks"), "{msg}");
+        }
+    }
+}

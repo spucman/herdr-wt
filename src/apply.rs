@@ -49,7 +49,16 @@ fn copy_file(source: &Dir, from: &OsStr, target: &Dir, to: &OsStr) -> Result<()>
     Ok(())
 }
 
-fn copy_dir(source: &Dir, target: &Dir, at: &Path, excluded: Option<&Path>) -> Result<()> {
+/// Sets the source mode on `target` after copying its contents. The top-level
+/// payload passes `apply_mode = false`: renaming a directory to a new parent
+/// needs write permission on it, so its mode is applied after publication.
+fn copy_dir(
+    source: &Dir,
+    target: &Dir,
+    at: &Path,
+    excluded: Option<&Path>,
+    apply_mode: bool,
+) -> Result<()> {
     for item in source.entries()? {
         let name = item?.file_name();
         let path = at.join(&name);
@@ -68,6 +77,7 @@ fn copy_dir(source: &Dir, target: &Dir, at: &Path, excluded: Option<&Path>) -> R
                 &target.open_dir_nofollow(&name)?,
                 &path,
                 excluded,
+                true,
             )?;
         } else if m.is_file() {
             copy_file(source, &name, target, &name)
@@ -77,21 +87,50 @@ fn copy_dir(source: &Dir, target: &Dir, at: &Path, excluded: Option<&Path>) -> R
         }
     }
     #[cfg(unix)]
-    {
-        use rustix::fs::{fchmod, fstat, openat, Mode, OFlags};
+    if apply_mode {
+        set_dir_mode(source, target).context("set staged directory permissions")?;
+    }
+    #[cfg(not(unix))]
+    let _ = apply_mode;
+    Ok(())
+}
+
+/// Gives `target` the permission bits of `source`.
+#[cfg(unix)]
+fn set_dir_mode(source: &Dir, target: &Dir) -> Result<()> {
+    HeldDir::capture(source, target)?.apply()
+}
+
+/// A directory descriptor plus the mode it should get. The descriptor follows
+/// the directory across renames, so the mode can be applied after publication
+/// without any name lookup that another writer could redirect.
+#[cfg(unix)]
+struct HeldDir {
+    handle: rustix::fd::OwnedFd,
+    mode: rustix::fs::Mode,
+}
+
+#[cfg(unix)]
+impl HeldDir {
+    fn capture(source: &Dir, target: &Dir) -> Result<Self> {
+        use rustix::fs::{fstat, openat, Mode, OFlags};
 
         let mode = Mode::from_raw_mode(fstat(source)?.st_mode & 0o777);
         // Capability directories may use O_PATH on Linux, which fchmod
-        // rejects. Open a real descriptor relative to the staged directory.
+        // rejects. Open a real descriptor relative to the directory.
         let handle = openat(
             target,
             ".",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        fchmod(handle, mode).context("set staged directory permissions")?;
+        Ok(Self { handle, mode })
     }
-    Ok(())
+
+    fn apply(self) -> Result<()> {
+        rustix::fs::fchmod(self.handle, self.mode)?;
+        Ok(())
+    }
 }
 
 fn apply_entry(
@@ -110,6 +149,7 @@ fn apply_entry(
         digest(names.recovery_key(&entry.path).as_os_str())
     );
     let existing = parent(target, &entry.path, false)?;
+    let mut replacing = false;
     if let Some((dir, leaf)) = &existing {
         if inspect(dir, OsStr::new(&backup_name))?.is_some() {
             let backup = c
@@ -131,7 +171,20 @@ fn apply_entry(
                 println!("skipped {name} (exists)");
                 return Ok(());
             }
+            replacing = true;
             if m.is_dir() && !is_link(&m) {
+                #[cfg(unix)]
+                if let Err(e) = rustix::fs::accessat(
+                    dir,
+                    *leaf,
+                    rustix::fs::Access::WRITE_OK,
+                    rustix::fs::AtFlags::empty(),
+                ) {
+                    if matches!(e, rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS) {
+                        bail!("cannot replace {name} (read-only)");
+                    }
+                    return Err(io::Error::from(e)).context(format!("check {name}"));
+                }
                 replace::ensure_recoverable(
                     &dir.open_dir_nofollow(leaf)?,
                     &c.target.join(&entry.path),
@@ -140,14 +193,14 @@ fn apply_entry(
         }
     }
     if dry {
-        println!(
-            "would {} {name}",
-            if config.mode == Mode::Copy {
-                "copy"
-            } else {
-                "link"
-            }
-        );
+        let verb = if replacing {
+            "replace"
+        } else if config.mode == Mode::Copy {
+            "copy"
+        } else {
+            "link"
+        };
+        println!("would {verb} {name}");
         return Ok(());
     }
     let (src, src_name) = source_parent(source, &entry.source)?;
@@ -164,6 +217,8 @@ fn apply_entry(
     }
     let stage = Stage::new(&dst)?;
     let payload = OsStr::new("payload");
+    #[cfg(unix)]
+    let mut held = None;
     if config.mode == Mode::Symlink {
         let m = src.symlink_metadata(src_name)?;
         if is_link(&m) || (!m.is_dir() && !m.is_file()) {
@@ -172,11 +227,18 @@ fn apply_entry(
         link(&stage.dir, payload, &joined, &m)?;
     } else if entry.dir {
         mkdir(&stage.dir, payload)?;
+        let from = src.open_dir_nofollow(src_name)?;
+        let to = stage.dir.open_dir_nofollow(payload)?;
+        #[cfg(unix)]
+        {
+            held = Some(HeldDir::capture(&from, &to).context("read directory permissions")?);
+        }
         copy_dir(
-            &src.open_dir_nofollow(src_name)?,
-            &stage.dir.open_dir_nofollow(payload)?,
+            &from,
+            &to,
             &entry.source,
             c.target.strip_prefix(&c.source).ok(),
+            false,
         )?;
     } else {
         copy_file(&src, src_name, &stage.dir, payload)?;
@@ -201,14 +263,19 @@ fn apply_entry(
     } else {
         stage.dir.rename(payload, &dst, dst_name)?;
     }
-    println!(
-        "{} {name}",
-        if config.mode == Mode::Copy {
-            "copied"
-        } else {
-            "linked"
-        }
-    );
+    #[cfg(unix)]
+    if let Some(held) = held {
+        held.apply()
+            .context("installed, but could not set directory permissions")?;
+    }
+    let verb = if existing.is_some() {
+        "replaced"
+    } else if config.mode == Mode::Copy {
+        "copied"
+    } else {
+        "linked"
+    };
+    println!("{verb} {name}");
     Ok(())
 }
 
