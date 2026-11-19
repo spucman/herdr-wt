@@ -11,7 +11,7 @@ overwrite = false
 files = [
     ".env.local",          # Copy one file, even if Git ignores it.
     "settings/",           # Copy the whole directory.
-    "fixtures/**/*.json",  # Copy matching regular files recursively.
+    "fixtures/**/*.json",  # Copy matching regular files recursively (symlinks are skipped with a warning).
 ]
 
 # Optional: uncomment to run in the target worktree after copying.

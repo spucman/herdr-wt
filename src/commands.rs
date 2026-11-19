@@ -33,7 +33,7 @@ pub fn run(config: &Config, c: &Checkouts, dry: bool, skip: bool) -> crate::Phas
             println!("would run {n}/{total} {}", quote(Path::new(script)));
             continue;
         }
-        println!("run {n}/{total}");
+        println!("run {n}/{total} {}", quote(Path::new(script)));
         let start = Instant::now();
         #[cfg(unix)]
         let mut process = {
@@ -77,10 +77,12 @@ pub fn run(config: &Config, c: &Checkouts, dry: bool, skip: bool) -> crate::Phas
                     #[cfg(unix)]
                     {
                         use std::os::unix::process::ExitStatusExt;
-                        eprintln!(
-                            "command failed {n}/{total} signal {}",
-                            status.signal().unwrap_or(0)
-                        );
+                        match status.signal() {
+                            Some(sig) => eprintln!("command failed {n}/{total} signal {sig}"),
+                            None => {
+                                eprintln!("command failed {n}/{total} terminated abnormally")
+                            }
+                        }
                     }
                     #[cfg(windows)]
                     eprintln!("command failed {n}/{total}: {status}");
@@ -88,7 +90,7 @@ pub fn run(config: &Config, c: &Checkouts, dry: bool, skip: bool) -> crate::Phas
             }
             Err(e) => {
                 failed = true;
-                eprintln!("command failed {n}/{total}: {e}");
+                eprintln!("command failed {n}/{total}: could not start: {e}");
             }
         }
     }

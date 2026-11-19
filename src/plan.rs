@@ -31,30 +31,50 @@ enum Segment {
 
 fn selector(raw: &str) -> Result<(&str, Option<Vec<Segment>>)> {
     let path = raw.strip_suffix('/').unwrap_or(raw);
-    if raw.trim().is_empty() || raw.contains(['\\', ':', '\0']) {
-        bail!("blank or unsafe path");
+    if raw.trim().is_empty() {
+        bail!("entry is blank");
+    }
+    if raw.contains('\0') {
+        bail!("NUL is not allowed");
+    }
+    if raw.contains('\\') {
+        bail!("backslash is not allowed, use '/'");
+    }
+    if raw.contains(':') {
+        bail!("':' is not allowed (drive prefix or stream name)");
+    }
+    if raw.starts_with('/') {
+        bail!("absolute paths are not allowed");
     }
     let mut parts = Vec::new();
     let mut glob = false;
     for s in path.split('/') {
-        if s.bytes().all(|b| matches!(b, b'.' | b' ')) || protected_name(OsStr::new(s)) {
-            bail!("unsafe path component");
+        if s.is_empty() {
+            bail!("empty path segment is not allowed");
+        }
+        if s.bytes().all(|b| matches!(b, b'.' | b' ')) {
+            bail!("{s:?} is not allowed");
+        }
+        if protected_name(OsStr::new(s)) {
+            bail!("{s:?} is a protected name");
         }
         if cfg!(windows) && !s.contains(['*', '?', '[', ']']) && windows_bad(s) {
-            bail!("invalid Windows path component");
+            bail!("{s:?} cannot be used on Windows");
         }
         if s == "**" {
             glob = true;
             parts.push(Segment::AnyDepth);
         } else {
             if s.contains("**") {
-                bail!("** must occupy a whole segment");
+                bail!("\"**\" must be a whole path segment");
             }
             if s.contains(['*', '?', '[', ']']) {
                 glob = true;
                 validate_brackets(s)?;
             }
-            parts.push(Segment::Pattern(Pattern::new(s)?));
+            parts.push(Segment::Pattern(
+                Pattern::new(s).with_context(|| format!("invalid glob pattern {s:?}"))?,
+            ));
         }
     }
     Ok((path, glob.then_some(parts)))
@@ -113,8 +133,18 @@ fn glob_walk(
     segments: &[Segment],
     states: &[usize],
     out: &mut Vec<PathBuf>,
+    links: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let mut entries = dir.entries()?.collect::<io::Result<Vec<_>>>()?;
+    let shown = if rel.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        rel
+    };
+    let mut entries = dir
+        .entries()
+        .with_context(|| format!("read {}", quote(shown)))?
+        .collect::<io::Result<Vec<_>>>()
+        .with_context(|| format!("read {}", quote(shown)))?;
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let name = entry.file_name();
@@ -144,9 +174,12 @@ fn glob_walk(
         if next.is_empty() {
             continue;
         }
-        let m = dir.symlink_metadata(&name)?;
         let path = rel.join(&name);
+        let m = dir
+            .symlink_metadata(&name)
+            .with_context(|| format!("read {}", quote(&path)))?;
         if fs::is_link(&m) {
+            links.push(path);
             continue;
         }
         if m.is_file() && file_match {
@@ -155,13 +188,17 @@ fn glob_walk(
             next.sort_unstable();
             next.dedup();
             closure(&mut next, segments);
-            let child = dir.open_dir_nofollow(&name)?;
+            let child = dir
+                .open_dir_nofollow(&name)
+                .with_context(|| format!("read {}", quote(&path)))?;
             match child.symlink_metadata(".git") {
                 Ok(_) => continue,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("read {}", quote(&path.join(".git"))))
+                }
             }
-            glob_walk(&child, &path, segments, &next, out)?;
+            glob_walk(&child, &path, segments, &next, out, links)?;
         }
     }
     Ok(())
@@ -303,6 +340,7 @@ pub fn select(
 ) -> Result<Vec<Entry>> {
     let mut selectors = HashSet::new();
     let mut all = Vec::new();
+    let mut links = std::collections::BTreeSet::new();
     for (i, raw) in config.files.iter().enumerate() {
         let context = || format!("config error: files[{}] {:?}", i + 1, raw);
         let (path, glob) = selector(raw).with_context(context)?;
@@ -312,10 +350,19 @@ pub fn select(
         }
         if let Some(segments) = glob {
             let mut paths = Vec::new();
+            let mut found = Vec::new();
             let mut states = vec![0];
             closure(&mut states, &segments);
-            glob_walk(source, Path::new(""), &segments, &states, &mut paths)
-                .with_context(context)?;
+            glob_walk(
+                source,
+                Path::new(""),
+                &segments,
+                &states,
+                &mut paths,
+                &mut found,
+            )
+            .with_context(context)?;
+            links.extend(found);
             if paths.is_empty() {
                 eprintln!("warning: glob matched no files: {}", quote(Path::new(path)));
             }
@@ -343,8 +390,8 @@ pub fn select(
         .map(|e| e.path.clone())
         .collect();
     all.retain(|e| {
-        if e.path.ancestors().skip(1).any(|p| dirs.contains(p)) {
-            println!("covered {}", quote(&e.path));
+        if let Some(dir) = e.path.ancestors().skip(1).find(|p| dirs.contains(*p)) {
+            println!("covered {} by {}", quote(&e.path), quote(dir));
             false
         } else {
             true
@@ -364,6 +411,15 @@ pub fn select(
             true
         }
     });
+    let selected: HashSet<_> = all.iter().map(|e| e.path.clone()).collect();
+    for link in &links {
+        if !link.ancestors().any(|p| selected.contains(p)) {
+            eprintln!(
+                "warning: skipped {} (symlink matched by glob; list it literally)",
+                quote(link)
+            );
+        }
+    }
     let names = Names::for_target(target);
     let excluded = checkouts.target.strip_prefix(&checkouts.source).ok();
     let source_in_target = checkouts.source.strip_prefix(&checkouts.target).ok();
@@ -403,6 +459,115 @@ pub fn select(
 mod tests {
     use super::*;
 
+    fn rejected(raw: &str, needle: &str) {
+        match selector(raw) {
+            Ok(_) => panic!("accepted {raw:?}"),
+            Err(e) => assert!(format!("{e:#}").contains(needle), "{raw:?}: {e:#}"),
+        }
+    }
+
+    fn accepted(raw: &str, path: &str, glob: bool) {
+        match selector(raw) {
+            Ok((p, g)) => {
+                assert_eq!(p, path, "{raw:?}");
+                assert_eq!(g.is_some(), glob, "{raw:?}");
+            }
+            Err(e) => panic!("rejected {raw:?}: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn selector_names_blank_nul_backslash_and_colon_rules() {
+        rejected("", "entry is blank");
+        rejected("   ", "entry is blank");
+        rejected("x\0", "NUL is not allowed");
+        rejected("a\\b", "backslash is not allowed, use '/'");
+        rejected("C:/x", "':' is not allowed (drive prefix or stream name)");
+        rejected("a:b", "':' is not allowed (drive prefix or stream name)");
+    }
+
+    #[test]
+    fn selector_names_absolute_and_empty_segment_rules() {
+        rejected("/root", "absolute paths are not allowed");
+        rejected("/", "absolute paths are not allowed");
+        rejected("a//", "empty path segment is not allowed");
+        rejected("a//b", "empty path segment is not allowed");
+    }
+
+    #[test]
+    fn selector_names_dot_and_space_only_segments() {
+        for raw in [".", "./x", "..", "../x", "a/../b", "...", "a/ /b", ". "] {
+            rejected(raw, "is not allowed");
+        }
+        rejected("a/../b", "\"..\" is not allowed");
+    }
+
+    #[test]
+    fn selector_names_protected_names() {
+        for raw in [
+            ".git",
+            ".GIT",
+            "a/.gIt/x",
+            ".GIT/",
+            ".git.",
+            ".git ",
+            ".git. .",
+            "a/.git../x",
+            "GIT~1",
+            "git~12/x",
+            "a/Git~2",
+            "GIT~1.",
+            ".herdr-wt-tmp-x",
+            ".HERDR-WT-TMP-stage",
+        ] {
+            rejected(raw, "is a protected name");
+        }
+    }
+
+    #[test]
+    fn selector_names_glob_syntax_rules() {
+        rejected("some**name", "\"**\" must be a whole path segment");
+        rejected("***", "\"**\" must be a whole path segment");
+        rejected("bad]", "unexpected ] in glob");
+        for raw in ["bad[", "[!"] {
+            match selector(raw) {
+                Ok(_) => panic!("accepted {raw:?}"),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    assert!(
+                        msg.contains("unclosed") || msg.contains("invalid glob class"),
+                        "{raw:?}: {msg}"
+                    );
+                }
+            }
+        }
+        rejected("[[x]", "invalid glob class");
+    }
+
+    #[test]
+    fn selector_accepts_valid_entries() {
+        accepted(".env", ".env", false);
+        accepted("a/b", "a/b", false);
+        accepted("with space/x", "with space/x", false);
+        accepted("**/x", "**/x", true);
+        accepted("a/**/b", "a/**/b", true);
+        accepted("*", "*", true);
+        accepted("?", "?", true);
+        accepted("[ab]x", "[ab]x", true);
+        accepted(".vscode/", ".vscode", false);
+        for raw in [".gitignore", ".github/x", "git~", "git~a", "my.git"] {
+            accepted(raw, raw, false);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selector_rejects_windows_reserved_names() {
+        for raw in ["CON", "nul.txt", "a."] {
+            rejected(raw, "cannot be used on Windows");
+        }
+    }
+
     #[test]
     fn case_policy_matches_the_checkout_volume() {
         let tmp = tempfile::tempdir().unwrap();
@@ -437,5 +602,194 @@ mod tests {
         let mut seen = HashMap::new();
         register(names, &mut seen, Path::new("Config/a")).unwrap();
         register(names, &mut seen, Path::new("config/b")).unwrap();
+    }
+
+    type Walked = (Vec<PathBuf>, Vec<PathBuf>);
+
+    fn walk(root: &Path, pattern: &str) -> Result<Walked> {
+        let (_, segments) = selector(pattern)?;
+        let segments = segments.expect("pattern is a glob");
+        let mut states = vec![0];
+        closure(&mut states, &segments);
+        let mut files = Vec::new();
+        let mut links = Vec::new();
+        glob_walk(
+            &fs::open_root(root)?,
+            Path::new(""),
+            &segments,
+            &states,
+            &mut files,
+            &mut links,
+        )?;
+        Ok((files, links))
+    }
+
+    fn slashed(paths: Vec<PathBuf>) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| {
+                let parts: Vec<_> = p.iter().map(|s| s.to_string_lossy()).collect();
+                parts.join("/")
+            })
+            .collect()
+    }
+
+    fn try_glob(root: &Path, pattern: &str) -> Result<(Vec<String>, Vec<String>)> {
+        let (files, links) = walk(root, pattern)?;
+        let mut files = slashed(files);
+        let mut links = slashed(links);
+        files.sort();
+        links.sort();
+        Ok((files, links))
+    }
+
+    fn glob(root: &Path, pattern: &str) -> (Vec<String>, Vec<String>) {
+        try_glob(root, pattern).unwrap_or_else(|e| panic!("{pattern:?}: {e:#}"))
+    }
+
+    fn tree(paths: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for path in paths {
+            let full = tmp.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, "x").unwrap();
+        }
+        tmp
+    }
+
+    fn files(root: &Path, pattern: &str) -> Vec<String> {
+        glob(root, pattern).0
+    }
+
+    #[test]
+    fn any_depth_matches_zero_or_more_directories() {
+        let tmp = tree(&["x", "a/x", "a/b/x", "a/b/y"]);
+        assert_eq!(files(tmp.path(), "**/x"), ["a/b/x", "a/x", "x"]);
+    }
+
+    #[test]
+    fn middle_any_depth_matches_zero_or_more_directories() {
+        let tmp = tree(&["a/x", "a/b/c/x", "x", "b/x"]);
+        assert_eq!(files(tmp.path(), "a/**/x"), ["a/b/c/x", "a/x"]);
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directories() {
+        let tmp = tree(&["a.txt", "a/b.txt"]);
+        assert_eq!(files(tmp.path(), "*.txt"), ["a.txt"]);
+    }
+
+    #[test]
+    fn star_matches_dotfiles() {
+        let tmp = tree(&[".env"]);
+        assert_eq!(files(tmp.path(), "*"), [".env"]);
+    }
+
+    #[test]
+    fn glob_is_case_sensitive() {
+        let tmp = tree(&["a.txt"]);
+        assert!(files(tmp.path(), "*.TXT").is_empty());
+    }
+
+    #[test]
+    fn directories_are_never_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        assert!(files(tmp.path(), "*").is_empty());
+    }
+
+    #[test]
+    fn root_git_directory_is_skipped() {
+        let tmp = tree(&[".git/config", "x"]);
+        assert_eq!(files(tmp.path(), "**"), ["x"]);
+    }
+
+    #[test]
+    fn nested_repository_is_not_descended() {
+        let tmp = tree(&["a/.git", "a/x", "b/y"]);
+        assert_eq!(files(tmp.path(), "**"), ["b/y"]);
+    }
+
+    #[test]
+    fn temporary_directories_are_skipped() {
+        let tmp = tree(&[".herdr-wt-tmp-x/f", "x"]);
+        assert_eq!(files(tmp.path(), "**"), ["x"]);
+    }
+
+    #[test]
+    fn results_are_sorted() {
+        let tmp = tree(&["b", "a/c"]);
+        let (found, _) = walk(tmp.path(), "**").unwrap();
+        assert_eq!(slashed(found), ["a/c", "b"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_reports_matched_symlink_without_following() {
+        let tmp = tree(&["real.txt"]);
+        std::os::unix::fs::symlink("real.txt", tmp.path().join("link.txt")).unwrap();
+        let (found, links) = glob(tmp.path(), "*.txt");
+        assert_eq!(found, ["real.txt"]);
+        assert_eq!(links, ["link.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_reports_symlinked_dir_without_descending() {
+        let tmp = tree(&["d/f"]);
+        std::os::unix::fs::symlink("d", tmp.path().join("ldir")).unwrap();
+        let (found, links) = glob(tmp.path(), "ldir/*");
+        assert!(found.is_empty());
+        assert_eq!(links, ["ldir"]);
+        let (found, links) = glob(tmp.path(), "**/f");
+        assert_eq!(found, ["d/f"]);
+        assert_eq!(links, ["ldir"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_ignores_unmatched_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("x", tmp.path().join("link.md")).unwrap();
+        let (found, links) = glob(tmp.path(), "*.txt");
+        assert!(found.is_empty());
+        assert!(links.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_terminates() {
+        let tmp = tree(&["x"]);
+        std::os::unix::fs::symlink(".", tmp.path().join("loop")).unwrap();
+        let (found, links) = glob(tmp.path(), "**");
+        assert_eq!(found, ["x"]);
+        assert_eq!(links, ["loop"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_name_is_skipped_without_panic() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tree(&["ok"]);
+        std::fs::write(tmp.path().join(OsStr::from_bytes(b"bad\xff")), "x").unwrap();
+        assert_eq!(files(tmp.path(), "*"), ["ok"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subdir_is_an_error_naming_the_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tree(&["d/locked/f"]);
+        let locked = tmp.path().join("d/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let result = try_glob(tmp.path(), "d/**");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            eprintln!("skipped: permissions are not enforced (root)");
+            return;
+        }
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("locked"), "{err:#}");
     }
 }
