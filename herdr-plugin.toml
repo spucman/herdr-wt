@@ -1,6 +1,6 @@
 id = "herdr-wt"
 name = "Worktree initialization"
-version = "0.0.0"
+version = "0.1.0"
 min_herdr_version = "0.9.5"
 description = "Initialize worktrees from the source checkout"
 platforms = ["linux", "macos", "windows"]
