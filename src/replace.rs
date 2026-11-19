@@ -340,7 +340,7 @@ mod tests {
     }
 
     /// Best-effort test cleanup: make every directory under `path` traversable again.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn restore_modes(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         if fs::set_permissions(path, fs::Permissions::from_mode(0o700)).is_err() {
